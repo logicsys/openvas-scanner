@@ -34,6 +34,7 @@
 #include <gvm/base/networking.h>
 #include <gvm/base/prefs.h> /* for prefs_get() */
 #include <gvm/util/kb.h>
+#include <gvm/util/sshutils.h>
 #include <libssh/sftp.h>
 #include <netinet/in.h>
 #include <stdio.h>
@@ -403,6 +404,108 @@ nasl_ssh_connect (lex_ctxt *lexic)
   session_table[tbl_slot].user_set = 0;
   session_table[tbl_slot].verbose = verbose;
 
+  /* Disable SSH agent and automatic key loading to prevent interactive prompts.
+     We'll handle authentication manually with KB credentials. */
+  ssh_options_set (session, SSH_OPTIONS_PUBLICKEY_ACCEPTED_TYPES,
+                   "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256,"
+                   "ssh-rsa,ssh-dss");
+
+  /* Apply user SSH configuration from ~/.ssh/config.
+     Set up SSH_ASKPASS to provide passphrase automatically for ProxyCommand. */
+  const char *passphrase = NULL;
+  char *askpass_script = NULL;
+  int askpass_fd = -1;
+  char *old_ssh_askpass = NULL;
+  char *old_display = NULL;
+
+  /* Get passphrase from KB if available */
+  passphrase = get_str_var_by_name (lexic, "passphrase");
+  if (!passphrase)
+    {
+      int type = KB_TYPE_STR;
+      passphrase = (const char *) plug_get_key (
+        lexic->script_infos, "Secret/SSH/passphrase", &type, NULL, 0);
+    }
+
+  /* If we have a passphrase, create SSH_ASKPASS script for ProxyCommand */
+  if (passphrase)
+    {
+      askpass_script = g_strdup ("/tmp/openvas-askpass-XXXXXX");
+      askpass_fd = mkstemp (askpass_script);
+      if (askpass_fd >= 0)
+        {
+          char *script_content = g_strdup_printf (
+            "#!/bin/sh\n"
+            "echo '%s'\n",
+            passphrase);
+          if (write (askpass_fd, script_content, strlen (script_content)) > 0)
+            {
+              fchmod (askpass_fd, 0700);
+              close (askpass_fd);
+
+              /* Set SSH_ASKPASS environment variables */
+              old_ssh_askpass = getenv ("SSH_ASKPASS") ?
+                g_strdup (getenv ("SSH_ASKPASS")) : NULL;
+              old_display = getenv ("DISPLAY") ?
+                g_strdup (getenv ("DISPLAY")) : NULL;
+
+              setenv ("SSH_ASKPASS", askpass_script, 1);
+              setenv ("SSH_ASKPASS_REQUIRE", "force", 1);
+              /* Set a dummy DISPLAY if not set, required for SSH_ASKPASS */
+              if (!getenv ("DISPLAY"))
+                setenv ("DISPLAY", ":0", 1);
+
+              if (verbose)
+                g_message ("Set up SSH_ASKPASS for ProxyCommand authentication");
+            }
+          else
+            {
+              close (askpass_fd);
+              unlink (askpass_script);
+              g_free (askpass_script);
+              askpass_script = NULL;
+            }
+          g_free (script_content);
+        }
+      else
+        {
+          g_free (askpass_script);
+          askpass_script = NULL;
+        }
+    }
+
+  /* Temporarily redirect stdin to /dev/null to prevent any interactive
+     prompts during config parsing. */
+  int saved_stdin = -1;
+  int dev_null = -1;
+  saved_stdin = dup (STDIN_FILENO);
+  dev_null = open ("/dev/null", O_RDONLY);
+  if (dev_null >= 0)
+    {
+      dup2 (dev_null, STDIN_FILENO);
+      close (dev_null);
+    }
+
+  if (gvm_ssh_apply_user_config (session, ip_str) != 0)
+    {
+      if (verbose)
+        g_message ("Failed to apply SSH user config for '%s': %s", ip_str,
+                   ssh_get_error (session));
+      /* Continue despite error - user config is optional */
+    }
+
+  /* Restore original stdin */
+  if (saved_stdin >= 0)
+    {
+      dup2 (saved_stdin, STDIN_FILENO);
+      close (saved_stdin);
+    }
+
+  /* Clear any identity files loaded by config parsing to prevent interactive
+     prompts. We'll load identity files manually during authentication using
+     the passphrase from KB. */
+  ssh_options_set (session, SSH_OPTIONS_IDENTITY, NULL);
+
   /* Connect to the host.  */
   if (verbose)
     g_message ("Connecting to SSH server '%s' (port %d, sock %d)", ip_str, port,
@@ -425,11 +528,57 @@ nasl_ssh_connect (lex_ctxt *lexic)
       else
         ssh_free (session);
 
+      /* Cleanup SSH_ASKPASS script and environment */
+      if (askpass_script)
+        {
+          unlink (askpass_script);
+          g_free (askpass_script);
+          if (old_ssh_askpass)
+            {
+              setenv ("SSH_ASKPASS", old_ssh_askpass, 1);
+              g_free (old_ssh_askpass);
+            }
+          else
+            unsetenv ("SSH_ASKPASS");
+          unsetenv ("SSH_ASKPASS_REQUIRE");
+          if (old_display)
+            {
+              setenv ("DISPLAY", old_display, 1);
+              g_free (old_display);
+            }
+          else if (!old_display && getenv ("DISPLAY") &&
+                   strcmp (getenv ("DISPLAY"), ":0") == 0)
+            unsetenv ("DISPLAY");
+        }
+
       /* return 0 to indicate the error.  */
       /* FIXME: Set the last error string.  */
       retc = alloc_typed_cell (CONST_INT);
       retc->x.i_val = 0;
       return retc;
+    }
+
+  /* Cleanup SSH_ASKPASS script and environment after successful connection */
+  if (askpass_script)
+    {
+      unlink (askpass_script);
+      g_free (askpass_script);
+      if (old_ssh_askpass)
+        {
+          setenv ("SSH_ASKPASS", old_ssh_askpass, 1);
+          g_free (old_ssh_askpass);
+        }
+      else
+        unsetenv ("SSH_ASKPASS");
+      unsetenv ("SSH_ASKPASS_REQUIRE");
+      if (old_display)
+        {
+          setenv ("DISPLAY", old_display, 1);
+          g_free (old_display);
+        }
+      else if (!old_display && getenv ("DISPLAY") &&
+               strcmp (getenv ("DISPLAY"), ":0") == 0)
+        unsetenv ("DISPLAY");
     }
 
   /* How that we are connected, save the session.  */
@@ -972,6 +1121,63 @@ nasl_ssh_userauth (lex_ctxt *lexic)
         }
       ssh_key_free (key);
       /* Keep on trying.  */
+    }
+
+  /* Try authentication with identity files from SSH config (e.g., loaded by
+     gvm_ssh_apply_user_config). If we have a passphrase from KB, try common
+     identity files. */
+  if (!privkeystr && privkeypass && *privkeypass
+      && (methods & SSH_AUTH_METHOD_PUBLICKEY))
+    {
+      const char *identity_files[] = {".ssh/id_rsa", ".ssh/id_ecdsa",
+                                      ".ssh/id_ed25519", ".ssh/id_dsa", NULL};
+      const char *home = g_get_home_dir ();
+
+      if (home)
+        {
+          for (int i = 0; identity_files[i] != NULL; i++)
+            {
+              char *keyfile = g_build_filename (home, identity_files[i], NULL);
+              ssh_key key = NULL;
+
+              if (g_file_test (keyfile, G_FILE_TEST_EXISTS))
+                {
+                  if (verbose)
+                    g_message ("Trying identity file: %s", keyfile);
+
+                  rc = ssh_pki_import_privkey_file (keyfile, privkeypass, NULL,
+                                                    NULL, &key);
+                  if (rc == SSH_OK && key != NULL)
+                    {
+                      if (ssh_userauth_try_publickey (session, NULL, key)
+                          == SSH_AUTH_SUCCESS)
+                        {
+                          if (ssh_userauth_publickey (session, NULL, key)
+                              == SSH_AUTH_SUCCESS)
+                            {
+                              if (verbose)
+                                g_message (
+                                  "SSH public key authentication succeeded "
+                                  "with identity file: %s",
+                                  keyfile);
+                              retc_val = 0;
+                              ssh_key_free (key);
+                              g_free (keyfile);
+                              goto leave;
+                            }
+                        }
+                      ssh_key_free (key);
+                    }
+                  else if (verbose && rc != SSH_EOF)
+                    {
+                      /* SSH_EOF means file exists but wrong format/not a key */
+                      g_message ("Failed to load identity file %s: %s", keyfile,
+                                 ssh_get_error (session));
+                    }
+                }
+              g_free (keyfile);
+            }
+        }
     }
 
   if (verbose)
